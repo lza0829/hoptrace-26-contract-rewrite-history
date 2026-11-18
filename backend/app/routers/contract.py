@@ -73,3 +73,21 @@ def contract_proof(batch_id: str):
         return proof
     finally:
         conn.close()
+
+
+@router.get("/split-proof")
+def split_proof(batch_id: str, contract_version: int | None = None):
+    """只读分流对照核证：核对当次契约版本与两侧成员（登记码→正式 / 未登记码→隔离）。
+
+    返回核证结论 ok 与差异清单；传入 contract_version（当次分流版本）而证明版本不一致时，
+    ok=false 并给出 expected_version_mismatch。批次与证明均不存在 → 404。
+    """
+    conn = connect()
+    try:
+        ecc.ensure_tables(conn)
+        check = ecc.verify_batch_split(conn, batch_id, expected_version=contract_version)
+        if check is None:
+            raise HTTPException(404, "批次不存在")
+        return check
+    finally:
+        conn.close()

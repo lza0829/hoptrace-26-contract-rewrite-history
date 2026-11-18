@@ -244,3 +244,220 @@ def test_routes(env):
     assert p["live_counts"] == {"written": 1, "violations": 2, "quarantined": 2}
     q = client.get("/api/quarantine").json()
     assert any(row["batch_id"] == "B-API" for row in q)
+
+
+# ---------------------------------------------------------------- 分流对照证明
+
+def test_split_never_reverses_sides(env):
+    """回归：登记码必须进正式线，未登记码必须进隔离（曾经的返回顺序反了）。"""
+    ingest, ecc, connect, write_fixture = env
+    write_fixture(_batch("B-REV", codes=("PICKED", "TELEPORT")))
+    res = ingest.run_batch()
+    assert res["ok"], res
+    conn = connect()
+    try:
+        primary = conn.execute(
+            "SELECT event_code FROM hops WHERE batch_id='B-REV' AND channel='primary'"
+        ).fetchall()
+        assert [r["event_code"] for r in primary] == ["PICKED"]
+        quarantined = conn.execute(
+            "SELECT member_json FROM quarantine WHERE batch_id='B-REV' AND reason=?",
+            (ecc.REASON,),
+        ).fetchall()
+        assert [json.loads(r["member_json"])["event_code"] for r in quarantined] == ["TELEPORT"]
+        # 半入：未登记码在正式线任何形态都不允许
+        assert conn.execute(
+            "SELECT COUNT(*) AS c FROM hops WHERE batch_id='B-REV' AND event_code='TELEPORT'"
+        ).fetchone()["c"] == 0
+    finally:
+        conn.close()
+
+
+def test_split_proof_binds_version_and_both_sides(env):
+    ingest, ecc, connect, write_fixture = env
+    write_fixture(_batch("B-SP", codes=("PICKED", "LOST_PACKAGE")))
+    assert ingest.run_batch()["ok"]
+    conn = connect()
+    try:
+        proof = ecc.verify_batch_split(conn, "B-SP")
+        assert proof["ok"] is True
+        assert proof["contract_version"] == 1 and proof["split_version"] == 1
+        assert proof["counts"] == {"legal": 1, "violations": 1}
+        assert [m["event_code"] for m in proof["legal"]] == ["PICKED"]
+        assert [m["event_code"] for m in proof["violations"]] == ["LOST_PACKAGE"]
+        # 证明随批次固定：契约改版后旧批次版本不漂移
+        ecc.add_code(conn, "LOST_PACKAGE", "遗失")
+        conn.commit()
+        assert ecc.verify_batch_split(conn, "B-SP")["contract_version"] == 1
+    finally:
+        conn.close()
+
+
+def test_verify_fails_on_version_mismatch(env):
+    ingest, ecc, connect, write_fixture = env
+    write_fixture(_batch("B-VM", codes=("PICKED", "TELEPORT")))
+    assert ingest.run_batch()["ok"]
+    conn = connect()
+    try:
+        bad = ecc.verify_batch_split(conn, "B-VM", expected_version=99)
+        assert bad["ok"] is False
+        assert {d["code"] for d in bad["discrepancies"]} == {"expected_version_mismatch"}
+    finally:
+        conn.close()
+
+
+def test_verify_detects_cross_side_leakage(env):
+    ingest, ecc, connect, write_fixture = env
+    write_fixture(_batch("B-LK", codes=("PICKED", "TELEPORT")))
+    assert ingest.run_batch()["ok"]
+    conn = connect()
+    try:
+        # 未登记码半入正式线（同一隔离点又出现在正式线）
+        conn.execute(
+            """
+            INSERT INTO hops(id, waybill_id, event_ts, location_code, event_code, seq, channel, batch_id)
+            VALUES ('H-B-LK-2', 'WB-B-LK', '2026-11-18T08:00:00Z', 'T-HUB', 'TELEPORT', 9, 'primary', 'B-LK')
+            """
+        )
+        conn.commit()
+        check = ecc.verify_batch_split(conn, "B-LK")
+        assert check["ok"] is False
+        codes = {d["code"] for d in check["discrepancies"]}
+        assert "unregistered_code_in_primary" in codes
+        assert "violation_member_half_in_primary" in codes
+        # 登记码进隔离区
+        conn.execute(
+            "DELETE FROM hops WHERE id='H-B-LK-2'"
+        )
+        ecc.quarantine_violation(
+            conn, "B-LK", ecc.current_contract(conn),
+            {"id": "H-P2", "waybill_id": "WB-B-LK", "event_code": "PICKED"}, "手工误置",
+        )
+        conn.commit()
+        check2 = ecc.verify_batch_split(conn, "B-LK")
+        assert check2["ok"] is False
+        assert "registered_code_in_quarantine" in {d["code"] for d in check2["discrepancies"]}
+    finally:
+        conn.close()
+
+
+def test_replay_pins_version_and_proof_is_immutable(env):
+    ingest, ecc, connect, write_fixture = env
+    write_fixture(_batch("B-PIN", codes=("PICKED", "TELEPORT")))
+    assert ingest.run_batch()["ok"]
+    conn = connect()
+    try:
+        ecc.add_code(conn, "TELEPORT", "瞬移")  # 契约改版 → 新版本
+        conn.commit()
+    finally:
+        conn.close()
+    res = ingest.run_batch()  # 同批次重放必须沿用 v1，不因新版本翻案
+    assert res["ok"], res
+    assert res["report"]["contract_version"] == 1
+    assert res["report"]["pinned"] is True
+    assert res["report"]["written"] == 0
+    assert res["report"]["quarantined"] == 0
+    conn = connect()
+    try:
+        assert ecc.pinned_version(conn, "B-PIN") == 1
+        assert ecc.verify_batch_split(conn, "B-PIN")["contract_version"] == 1
+    finally:
+        conn.close()
+
+
+def test_replay_with_changed_members_fails_closed(env):
+    ingest, ecc, connect, write_fixture = env
+    write_fixture(_batch("B-MUT", codes=("PICKED",)))
+    assert ingest.run_batch()["ok"]
+    write_fixture(_batch("B-MUT", codes=("PICKED", "TELEPORT")))  # 同批次号换了成员
+    res = ingest.run_batch()
+    assert res["ok"] is False
+    assert "分流对照证明已固定" in res["error"]
+    conn = connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) AS c FROM hops WHERE batch_id='B-MUT' AND event_code='TELEPORT'"
+        ).fetchone()["c"] == 0
+    finally:
+        conn.close()
+
+
+def test_split_proof_endpoint(env):
+    ingest, ecc, connect, write_fixture = env
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+
+    client = TestClient(main.app)
+    assert client.get("/api/contract/split-proof", params={"batch_id": "B-NONE"}).status_code == 404
+    write_fixture(_batch("B-SE", codes=("PICKED", "LOST_PACKAGE", "TELEPORT")))
+    assert client.post("/api/ingest/run").json()["ok"]
+    r = client.get("/api/contract/split-proof", params={"batch_id": "B-SE"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True and body["contract_version"] == 1
+    assert body["counts"] == {"legal": 1, "violations": 2}
+    # 当次版本不一致 → 核证不通过
+    bad = client.get(
+        "/api/contract/split-proof", params={"batch_id": "B-SE", "contract_version": 2}
+    ).json()
+    assert bad["ok"] is False
+    assert {d["code"] for d in bad["discrepancies"]} == {"expected_version_mismatch"}
+    # 批次证明里也带分流对照
+    p = client.get("/api/contract/proof", params={"batch_id": "B-SE"}).json()
+    assert p["split_proof"]["ok"] is True
+
+
+def test_repository_mixed_fixture_end_to_end(env):
+    """对板夹具：同批混合登记码与未登记码，跑通对板（正式线 / 隔离 / 核证三方一致）。"""
+    import shutil
+    from pathlib import Path
+
+    ingest, ecc, connect, _ = env
+    from app.db import FIXTURES_DIR
+
+    repo_fixture = Path(__file__).resolve().parents[2] / "fixtures" / "ingest_batch.json"
+    shutil.copyfile(repo_fixture, FIXTURES_DIR / "ingest_batch.json")
+    res = ingest.run_batch()
+    assert res["ok"], res
+    rep = res["report"]
+    assert rep["batch_id"] == "B-DEMO-01"
+    assert (rep["input"], rep["written"], rep["violations"], rep["quarantined"]) == (4, 2, 2, 2)
+    assert rep["violation_codes"] == ["LOST_PACKAGE", "TELEPORT"]
+    assert rep["split_proof_ok"] is True
+
+    conn = connect()
+    try:
+        # 登记码进正式线
+        primary = {
+            r["event_code"]
+            for r in conn.execute(
+                "SELECT event_code FROM hops WHERE batch_id='B-DEMO-01' AND channel='primary'"
+            ).fetchall()
+        }
+        assert primary == {"OUT_FOR_DELIVERY"}
+        # 未登记码只在隔离区
+        q = {
+            json.loads(r["member_json"])["event_code"]
+            for r in conn.execute(
+                "SELECT member_json FROM quarantine WHERE batch_id='B-DEMO-01'"
+            ).fetchall()
+        }
+        assert q == {"LOST_PACKAGE", "TELEPORT"}
+        # 核证三方一致
+        proof = ecc.verify_batch_split(conn, "B-DEMO-01")
+        assert proof["ok"] is True
+        assert proof["counts"] == {"legal": 2, "violations": 2}
+        # 混入件的正式线只含登记码，未登记码零残留
+        wb2 = [
+            r["event_code"]
+            for r in conn.execute(
+                "SELECT event_code FROM hops WHERE waybill_id='WB-1002' AND batch_id='B-DEMO-01' "
+                "AND channel='primary' AND retracted=0 ORDER BY event_ts"
+            ).fetchall()
+        ]
+        assert wb2 == ["OUT_FOR_DELIVERY"]
+    finally:
+        conn.close()
+
+

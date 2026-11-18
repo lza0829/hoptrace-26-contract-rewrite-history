@@ -7,11 +7,12 @@ from app.modules import event_code_contract as ecc
 
 
 def run_batch() -> dict:
-    """装载入口门禁：按当前契约版本逐点分流。
+    """装载入口门禁：按当次契约版本逐点分流，并写分流对照证明。
 
-    契约内合法点 → 正式时间线(hops primary) + 契约投影文案；
-    不在契约内的点 → 隔离区（写明契约违规），绝不半写入正式线。
-    失败闭：无可用契约版本 → 整批回滚报错；任何异常 → 回滚，不留半批。
+    登记码（契约内）→ 正式时间线(hops primary) + 契约投影文案；
+    未登记码（契约外）→ 隔离区（写明契约违规），绝不半写入正式线。
+    版本钉住：同一批次重放沿用首次分流版本，不因契约改版而漂移。
+    失败闭：无可用契约版本 → 整批回滚报错；分流后任一码挂错侧 → 回滚报错。
     """
     path = FIXTURES_DIR / "ingest_batch.json"
     if not path.exists():
@@ -25,7 +26,11 @@ def run_batch() -> dict:
     try:
         ecc.ensure_tables(conn)  # 幂等；在事务外执行，避免 DDL 隐式提交
         conn.execute("BEGIN IMMEDIATE")
-        contract = ecc.current_contract(conn)  # 无契约 → ContractError → 回滚（失败闭）
+        # 重放批次钉住首次分流版本；首跑取当前版本。无契约 → ContractError → 回滚（失败闭）。
+        version = ecc.pinned_version(conn, batch_id)
+        contract = (
+            ecc.get_contract(conn, version) if version is not None else ecc.current_contract(conn)
+        )
         legal, violations = ecc.split(contract, hops)
 
         written = 0
@@ -41,10 +46,14 @@ def run_batch() -> dict:
             if ecc.quarantine_violation(conn, batch_id, contract, hop, detail):
                 quarantined += 1
 
+        # 分流对照证明与正式线/隔离区同事务落库；版本不一致 → ContractError → 回滚。
+        ecc.record_split_proof(conn, batch_id, contract, legal, violations)
+
         report = {
             "batch_id": batch_id,
             "cutoff_ts": cutoff,
             "contract_version": contract["version"],
+            "pinned": version is not None,
             "input": len(hops),
             "written": written,
             "violations": len(violations),
@@ -57,6 +66,19 @@ def run_batch() -> dict:
             VALUES (?,?,?,?,?)
             """,
             (batch_id, cutoff, _now(), json.dumps(report, ensure_ascii=False), contract["version"]),
+        )
+
+        # 落库后即时核证：登记码不得进隔离、未登记码不得进正式（含半入）→ 否则整批回滚。
+        check = ecc.verify_batch_split(conn, batch_id, expected_version=contract["version"])
+        if not check or not check["ok"]:
+            detail = "; ".join(d["message"] for d in (check or {}).get("discrepancies", []))
+            raise ecc.ContractError(f"分流对照核证未通过，整批回滚: {detail or '证明缺失'}")
+
+        report["split_version"] = check["split_version"]
+        report["split_proof_ok"] = check["ok"]
+        conn.execute(
+            "UPDATE ingest_batches SET report_json=? WHERE id=?",
+            (json.dumps(report, ensure_ascii=False), batch_id),
         )
         conn.commit()
         return {"ok": True, "report": report}

@@ -23,6 +23,11 @@ export const api = {
     req('/api/contract/codes', { method: 'POST', body: JSON.stringify({ event_code, proj_text }) }),
   contractRemove: (code) => req(`/api/contract/codes/${encodeURIComponent(code)}`, { method: 'DELETE' }),
   contractProof: (batchId) => req(`/api/contract/proof?batch_id=${encodeURIComponent(batchId)}`),
+  contractSplitProof: (batchId, version) => {
+    const q = new URLSearchParams({ batch_id: batchId })
+    if (version !== undefined && version !== null && version !== '') q.set('contract_version', version)
+    return req(`/api/contract/split-proof?${q.toString()}`)
+  },
   proofs: (waybillId) =>
     req(waybillId ? `/api/status-proofs?waybill_id=${encodeURIComponent(waybillId)}` : '/api/status-proofs'),
 }

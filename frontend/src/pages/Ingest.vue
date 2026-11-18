@@ -36,9 +36,19 @@ async function run() {
         <div class="stat"><b>{{ result.report.written }}</b><span>正式写入</span></div>
         <div class="stat"><b>{{ result.report.violations }}</b><span>契约违规</span></div>
         <div class="stat"><b>{{ result.report.quarantined }}</b><span>隔离写入</span></div>
+        <div class="stat">
+          <b :class="result.report.split_proof_ok ? 'ok-text' : 'bad-text'">
+            {{ result.report.split_proof_ok ? '通过' : '不通过' }}
+          </b>
+          <span>分流对照核证</span>
+        </div>
       </div>
+      <p class="muted">
+        版本钉住：{{ result.report.pinned ? '批次已存在，沿用首次分流版本' : '本批首次装载，取当前契约版本' }}；
+        证明版本 v{{ result.report.split_version }}。
+      </p>
       <p v-if="result.report.violation_codes?.length" class="muted">
-        被拦截的 event_code：{{ result.report.violation_codes.join('、') }}（详见隔离页 / 契约页批次证明）
+        被拦截的 event_code：{{ result.report.violation_codes.join('、') }}（详见隔离页 / 契约页批次证明与分流核证）
       </p>
     </template>
     <p v-else-if="result && !result.ok" class="muted" style="margin-top:12px">装载失败：{{ result.error }}</p>
@@ -46,3 +56,8 @@ async function run() {
     <pre v-if="result" style="margin-top:16px;font-family:var(--mono);font-size:12px;white-space:pre-wrap">{{ result }}</pre>
   </div>
 </template>
+
+<style scoped>
+.ok-text { color: var(--mint); }
+.bad-text { color: var(--danger); }
+</style>
